@@ -5,11 +5,14 @@ from datetime import datetime
 from pynput import mouse, keyboard
 
 # --------- PARÁMETROS AJUSTABLES ---------
-MAX_TREMOR_DISTANCE = 5       # px: qué tan chico es un movimiento tipo temblor
-MAX_TREMOR_INTERVAL = 0.05    # seg: ventana de tiempo para temblor (50 ms)
+# 1) JITTER: vibración chica y rápida alrededor de la posición estable
+JITTER_DIST_MAX = 15        # px: hasta esta distancia puede ser "temblor chico"
+JITTER_INTERVAL_MAX = 0.25  # seg: si pasa en menos de 250 ms se considera temblor
 
-MAX_CLICK_MOVE_DISTANCE = 20  # px: movimiento grande antes de clic = sospechoso
-MAX_CLICK_LOOKBACK = 0.15     # seg: miramos 150 ms antes del clic
+# 2) JERK: sacudón brusco (movimiento grande y rápido)
+JERK_DIST_MIN = 30          # px: por encima de esto puede ser "sacudón"
+JERK_INTERVAL_MAX = 0.12    # seg: si pasa en menos de 120 ms
+
 # -----------------------------------------
 
 last_stable_pos = None
@@ -19,8 +22,7 @@ suppressing = False
 mouse_controller = mouse.Controller()
 running = True
 
-last_positions = []  # lista de (timestamp, (x, y))
-
+last_positions = []  # por ahora solo para debug futuro si queremos
 log_file = None
 
 
@@ -37,12 +39,13 @@ def init_log():
         path = get_log_path()
         log_file = open(path, "a", buffering=1, encoding="utf-8")  # line-buffered
         log(f"=== Inicio tremor_filter ({datetime.now().isoformat(timespec='seconds')}) ===")
-        log(f"PARAMS: MAX_TREMOR_DISTANCE={MAX_TREMOR_DISTANCE}, "
-            f"MAX_TREMOR_INTERVAL={MAX_TREMOR_INTERVAL}, "
-            f"MAX_CLICK_MOVE_DISTANCE={MAX_CLICK_MOVE_DISTANCE}, "
-            f"MAX_CLICK_LOOKBACK={MAX_CLICK_LOOKBACK}")
+        log(
+            f"PARAMS: JITTER_DIST_MAX={JITTER_DIST_MAX}, "
+            f"JITTER_INTERVAL_MAX={JITTER_INTERVAL_MAX}, "
+            f"JERK_DIST_MIN={JERK_DIST_MIN}, "
+            f"JERK_INTERVAL_MAX={JERK_INTERVAL_MAX}"
+        )
     except Exception as e:
-        # Si falla el log, seguimos igual
         print("No se pudo abrir el log:", e)
 
 
@@ -58,17 +61,14 @@ def close_log():
 
 
 def log(msg: str):
-    """Escribe una línea en el log con timestamp."""
     global log_file
     try:
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
         if log_file:
             log_file.write(line)
         else:
-            # fallback por si algo raro pasó
             print(line, end="")
     except Exception:
-        # nunca queremos romper por el log
         pass
 # ------------------------
 
@@ -80,6 +80,9 @@ def distance(p1, p2):
 
 
 def on_move(x, y):
+    """
+    Solo filtramos movimiento. No tocamos los clics.
+    """
     global last_stable_pos, last_move_time, suppressing, last_positions
 
     if suppressing:
@@ -87,10 +90,11 @@ def on_move(x, y):
 
     now = time.time()
 
-    # Guardamos historial reciente para el filtro de clics
+    # Guardamos historial por si en el futuro queremos debug extra
     last_positions.append((now, (x, y)))
-    last_positions = [(t, pos) for t, pos in last_positions if now - t <= 1.0]
+    last_positions[:] = [(t, pos) for t, pos in last_positions if now - t <= 1.0]
 
+    # Primera vez: tomamos como posición estable
     if last_stable_pos is None:
         last_stable_pos = (x, y)
         last_move_time = now
@@ -99,58 +103,52 @@ def on_move(x, y):
 
     dist = distance((x, y), last_stable_pos)
     dt = now - last_move_time
+    # Evitamos divisiones locas si dt es 0
+    speed = dist / dt if dt > 0 else float("inf")
 
-    if dist <= MAX_TREMOR_DISTANCE and dt <= MAX_TREMOR_INTERVAL:
-        # Temblor detectado
-        log(f"TEMBLOR movimiento: actual={x,y}, estable={last_stable_pos}, "
-            f"dist={dist:.2f}, dt={dt:.3f}")
+    # ---- REGLAS DE FILTRADO ----
+    # 1) JITTER: movimiento chico y rápido cerca de la posición estable
+    if dist <= JITTER_DIST_MAX and dt <= JITTER_INTERVAL_MAX:
+        log(
+            f"TEMBLOR_JITTER: actual={x,y}, estable={last_stable_pos}, "
+            f"dist={dist:.2f}, dt={dt:.3f}, speed={speed:.2f}"
+        )
         suppressing = True
         mouse_controller.position = last_stable_pos
         suppressing = False
-    else:
-        # Movimiento intencional
-        last_stable_pos = (x, y)
-        last_move_time = now
+        # No actualizamos last_stable_pos ni last_move_time
+        return
 
+    # 2) JERK: sacudón grande y rápido
+    if dist >= JERK_DIST_MIN and dt <= JERK_INTERVAL_MAX:
+        log(
+            f"TEMBLOR_JERK: actual={x,y}, estable={last_stable_pos}, "
+            f"dist={dist:.2f}, dt={dt:.3f}, speed={speed:.2f}"
+        )
+        suppressing = True
+        mouse_controller.position = last_stable_pos
+        suppressing = False
+        # No actualizamos last_stable_pos ni last_move_time
+        return
 
-def was_recent_large_movement():
-    if not last_positions:
-        return False
-
-    now = time.time()
-    recent = [(t, pos) for t, pos in last_positions if now - t <= MAX_CLICK_LOOKBACK]
-
-    if len(recent) < 2:
-        return False
-
-    t0, p0 = recent[0]
-    t1, p1 = recent[-1]
-
-    dist = distance(p0, p1)
-    return dist > MAX_CLICK_MOVE_DISTANCE
+    # Si no es ni jitter ni jerk, lo consideramos movimiento intencional
+    last_stable_pos = (x, y)
+    last_move_time = now
+    # Podrías loguear algunos movimientos "intencionales" cada tanto si querés:
+    # log(f"MOV_OK: nueva estable={last_stable_pos}, dist={dist:.2f}, dt={dt:.3f}")
 
 
 def on_click(x, y, button, pressed):
-    global suppressing
-
-    if not pressed:
-        return
-
-    if was_recent_large_movement():
-        log(f"CLICK SUPRIMIDO en {x,y} (movimiento grande justo antes)")
-        suppressing = True
-        try:
-            mouse_controller.release(button)
-        except Exception as e:
-            log(f"Error al soltar botón: {e}")
-        suppressing = False
-    else:
-        log(f"Click permitido en {x,y} ({button})")
+    """
+    No filtramos clics. Solo opcionalmente logueamos si querés verlos.
+    """
+    if pressed:
+        # Si querés menos ruido, comentá esta línea:
+        log(f"Click (NO filtrado) en {x,y} ({button})")
 
 
 def on_scroll(x, y, dx, dy):
-    # Si querés, podés loguear scroll también
-    # log(f"Scroll en {x,y} dx={dx} dy={dy}")
+    # Por ahora no tocamos el scroll
     pass
 
 
@@ -167,7 +165,7 @@ def on_key_press(key):
 
 def main():
     init_log()
-    print("Filtro de temblor y clics iniciado. Ver tremor_filter.log para detalles.")
+    print("Filtro de temblor (solo movimiento) iniciado. Ver tremor_filter.log para detalles.")
     print("Presioná ESC para cerrarlo.")
 
     log("Listeners de mouse y teclado iniciados.")
