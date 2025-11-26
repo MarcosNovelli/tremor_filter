@@ -6,10 +6,10 @@ from pynput import mouse, keyboard
 
 # --------- PARÁMETROS AJUSTABLES ---------
 # Radio alrededor de la posición filtrada en el que ignoramos movimiento (temblor chico)
-DEADZONE_RADIUS = 20      # px
+DEADZONE_RADIUS = 40      # px
 
 # Cuánto del movimiento hacia el objetivo aplicamos en cada paso (0 < SMOOTHING <= 1)
-SMOOTHING_FACTOR = 0.25   # 0.25 = el cursor recorre aprox el 25% del camino cada vez
+SMOOTHING_FACTOR = 0.4   # 0.25 = el cursor recorre aprox el 25% del camino cada vez
 
 # Paso máximo por actualización (para recortar sacudones muy grandes)
 MAX_STEP = 35             # px
