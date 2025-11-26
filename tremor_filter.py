@@ -6,12 +6,12 @@ from pynput import mouse, keyboard
 
 # --------- PARÁMETROS AJUSTABLES ---------
 # 1) JITTER: vibración chica y rápida alrededor de la posición estable
-JITTER_DIST_MAX = 15        # px: hasta esta distancia puede ser "temblor chico"
-JITTER_INTERVAL_MAX = 0.25  # seg: si pasa en menos de 250 ms se considera temblor
+JITTER_DIST_MAX = 25
+JITTER_INTERVAL_MAX = 0.35
 
-# 2) JERK: sacudón brusco (movimiento grande y rápido)
-JERK_DIST_MIN = 30          # px: por encima de esto puede ser "sacudón"
-JERK_INTERVAL_MAX = 0.12    # seg: si pasa en menos de 120 ms
+JERK_DIST_MIN = 20
+JERK_INTERVAL_MAX = 0.18
+
 
 # -----------------------------------------
 
