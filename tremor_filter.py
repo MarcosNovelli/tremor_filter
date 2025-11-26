@@ -5,30 +5,25 @@ from datetime import datetime
 from pynput import mouse, keyboard
 
 # --------- PARÁMETROS AJUSTABLES ---------
-# 1) JITTER: vibración chica y rápida alrededor de la posición estable
-JITTER_DIST_MAX = 25
-JITTER_INTERVAL_MAX = 0.35
+# Radio alrededor de la posición filtrada en el que ignoramos movimiento (temblor chico)
+DEADZONE_RADIUS = 20      # px
 
-JERK_DIST_MIN = 20
-JERK_INTERVAL_MAX = 0.18
+# Cuánto del movimiento hacia el objetivo aplicamos en cada paso (0 < SMOOTHING <= 1)
+SMOOTHING_FACTOR = 0.25   # 0.25 = el cursor recorre aprox el 25% del camino cada vez
 
-
+# Paso máximo por actualización (para recortar sacudones muy grandes)
+MAX_STEP = 35             # px
 # -----------------------------------------
 
-last_stable_pos = None
-last_move_time = None
+filtered_pos = None       # posición "real" que usamos para el cursor
 suppressing = False
-
-mouse_controller = mouse.Controller()
 running = True
 
-last_positions = []  # por ahora solo para debug futuro si queremos
 log_file = None
 
 
 # ---------- LOG ----------
 def get_log_path():
-    # Carpeta donde está el .py o el .exe
     base = os.path.dirname(os.path.abspath(sys.argv[0]))
     return os.path.join(base, "tremor_filter.log")
 
@@ -37,13 +32,12 @@ def init_log():
     global log_file
     try:
         path = get_log_path()
-        log_file = open(path, "a", buffering=1, encoding="utf-8")  # line-buffered
-        log(f"=== Inicio tremor_filter ({datetime.now().isoformat(timespec='seconds')}) ===")
+        log_file = open(path, "a", buffering=1, encoding="utf-8")
+        log(f"=== Inicio tremor_filter suavizado ({datetime.now().isoformat(timespec='seconds')}) ===")
         log(
-            f"PARAMS: JITTER_DIST_MAX={JITTER_DIST_MAX}, "
-            f"JITTER_INTERVAL_MAX={JITTER_INTERVAL_MAX}, "
-            f"JERK_DIST_MIN={JERK_DIST_MIN}, "
-            f"JERK_INTERVAL_MAX={JERK_INTERVAL_MAX}"
+            f"PARAMS: DEADZONE_RADIUS={DEADZONE_RADIUS}, "
+            f"SMOOTHING_FACTOR={SMOOTHING_FACTOR}, "
+            f"MAX_STEP={MAX_STEP}"
         )
     except Exception as e:
         print("No se pudo abrir el log:", e)
@@ -52,7 +46,7 @@ def init_log():
 def close_log():
     global log_file
     if log_file:
-        log(f"=== Fin tremor_filter ({datetime.now().isoformat(timespec='seconds')}) ===")
+        log(f"=== Fin tremor_filter suavizado ({datetime.now().isoformat(timespec='seconds')}) ===")
         try:
             log_file.close()
         except Exception:
@@ -79,76 +73,71 @@ def distance(p1, p2):
     return (dx * dx + dy * dy) ** 0.5
 
 
+mouse_controller = mouse.Controller()
+
+
 def on_move(x, y):
     """
-    Solo filtramos movimiento. No tocamos los clics.
+    Tomamos el movimiento bruto (x, y) pero SIEMPRE dibujamos una versión suavizada
+    alrededor de filtered_pos.
     """
-    global last_stable_pos, last_move_time, suppressing, last_positions
+    global filtered_pos, suppressing
 
     if suppressing:
         return
 
-    now = time.time()
+    raw_pos = (x, y)
 
-    # Guardamos historial por si en el futuro queremos debug extra
-    last_positions.append((now, (x, y)))
-    last_positions[:] = [(t, pos) for t, pos in last_positions if now - t <= 1.0]
-
-    # Primera vez: tomamos como posición estable
-    if last_stable_pos is None:
-        last_stable_pos = (x, y)
-        last_move_time = now
-        log(f"Posición estable inicial: {last_stable_pos}")
+    # Primera vez: tomamos como punto de partida
+    if filtered_pos is None:
+        filtered_pos = raw_pos
+        log(f"Posición inicial filtrada: {filtered_pos}")
         return
 
-    dist = distance((x, y), last_stable_pos)
-    dt = now - last_move_time
-    # Evitamos divisiones locas si dt es 0
-    speed = dist / dt if dt > 0 else float("inf")
+    dist = distance(raw_pos, filtered_pos)
 
-    # ---- REGLAS DE FILTRADO ----
-    # 1) JITTER: movimiento chico y rápido cerca de la posición estable
-    if dist <= JITTER_DIST_MAX and dt <= JITTER_INTERVAL_MAX:
-        log(
-            f"TEMBLOR_JITTER: actual={x,y}, estable={last_stable_pos}, "
-            f"dist={dist:.2f}, dt={dt:.3f}, speed={speed:.2f}"
-        )
+    # 1) Si está dentro de la deadzone, lo ignoramos (temblor chico)
+    if dist <= DEADZONE_RADIUS:
+        # Opcional: loguear sólo si querés ver cuánto jitter está ignorando
+        # log(f"IGNORED_JITTER: raw={raw_pos}, filtered={filtered_pos}, dist={dist:.2f}")
         suppressing = True
-        mouse_controller.position = last_stable_pos
+        mouse_controller.position = filtered_pos
         suppressing = False
-        # No actualizamos last_stable_pos ni last_move_time
         return
 
-    # 2) JERK: sacudón grande y rápido
-    if dist >= JERK_DIST_MIN and dt <= JERK_INTERVAL_MAX:
-        log(
-            f"TEMBLOR_JERK: actual={x,y}, estable={last_stable_pos}, "
-            f"dist={dist:.2f}, dt={dt:.3f}, speed={speed:.2f}"
-        )
-        suppressing = True
-        mouse_controller.position = last_stable_pos
-        suppressing = False
-        # No actualizamos last_stable_pos ni last_move_time
-        return
+    # 2) Si está fuera de la deadzone, nos movemos hacia ahí, pero suavizado
+    # Calculamos cuánto nos queremos mover en esta actualización
+    step = dist * SMOOTHING_FACTOR  # sólo una fracción del camino
+    if step > MAX_STEP:
+        step = MAX_STEP  # recortamos sacudones enormes
 
-    # Si no es ni jitter ni jerk, lo consideramos movimiento intencional
-    last_stable_pos = (x, y)
-    last_move_time = now
-    # Podrías loguear algunos movimientos "intencionales" cada tanto si querés:
-    # log(f"MOV_OK: nueva estable={last_stable_pos}, dist={dist:.2f}, dt={dt:.3f}")
+    ratio = step / dist  # factor para escalar el vector dirección
+
+    dx = (raw_pos[0] - filtered_pos[0]) * ratio
+    dy = (raw_pos[1] - filtered_pos[1]) * ratio
+
+    new_pos = (filtered_pos[0] + dx, filtered_pos[1] + dy)
+
+    log(
+        f"MOVE_FILTERED: raw={raw_pos}, from={filtered_pos}, to={new_pos}, "
+        f"dist_raw={dist:.2f}, step={step:.2f}"
+    )
+
+    filtered_pos = new_pos
+
+    suppressing = True
+    mouse_controller.position = new_pos
+    suppressing = False
 
 
 def on_click(x, y, button, pressed):
-    """
-    No filtramos clics. Solo opcionalmente logueamos si querés verlos.
-    """
+    # No tocamos clics, solo si querés verlos:
     if pressed:
-        # Si querés menos ruido, comentá esta línea:
-        log(f"Click (NO filtrado) en {x,y} ({button})")
+        log(f"Click en {x,y} ({button})")
 
 
 def on_scroll(x, y, dx, dy):
-    # Por ahora no tocamos el scroll
+    # No modificamos scroll
     pass
 
 
@@ -165,7 +154,7 @@ def on_key_press(key):
 
 def main():
     init_log()
-    print("Filtro de temblor (solo movimiento) iniciado. Ver tremor_filter.log para detalles.")
+    print("Filtro de temblor (suavizado con deadzone) iniciado. Ver tremor_filter.log para detalles.")
     print("Presioná ESC para cerrarlo.")
 
     log("Listeners de mouse y teclado iniciados.")
